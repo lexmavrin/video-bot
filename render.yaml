@@ -1,0 +1,11 @@
+# Render автоматически подхватит этот файл при подключении репозитория.
+# Используем Docker, чтобы был ffmpeg (нужен yt-dlp для склейки видео/аудио).
+services:
+  - type: web
+    name: video-dl-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: BOT_TOKEN
+        sync: false   # значение задашь вручную в панели Render (секрет)
