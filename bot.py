@@ -60,30 +60,49 @@ def start_health_server():
     logger.info("Health-сервер слушает порт %s", port)
 
 
-def download_video(url: str, out_dir: str) -> str:
-    """Скачивает видео по ссылке и возвращает путь к файлу."""
+VIDEO_EXT = {".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi"}
+IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".gif"}
+
+
+def download_media(url: str, out_dir: str) -> list:
+    """Скачивает медиа по ссылке (видео или фото) и возвращает список файлов."""
     ydl_opts = {
-        # Берём лучшее качество, влезающее в лимит; mp4 предпочтительно.
-        "format": "best[filesize<50M]/best[ext=mp4]/best",
-        "outtmpl": os.path.join(out_dir, "%(id)s.%(ext)s"),
-        "noplaylist": True,
+        # Лучшее в пределах лимита; для фото сработает запасной вариант "best".
+        "format": "best[filesize<50M]/best",
+        "outtmpl": os.path.join(out_dir, "%(autonumber)02d-%(id)s.%(ext)s"),
+        "noplaylist": True,      # не тянуть целый плейлист (напр. с YouTube)
         "quiet": True,
         "no_warnings": True,
         "merge_output_format": "mp4",
+        "ignoreerrors": True,    # карусель: не падать из-за одного элемента
     }
     if COOKIES_FILE and os.path.exists(COOKIES_FILE):
         ydl_opts["cookiefile"] = COOKIES_FILE
     if PROXY:
         ydl_opts["proxy"] = PROXY
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        return ydl.prepare_filename(info)
+        ydl.download([url])
+    # Собираем всё, что реально скачалось, по порядку.
+    files = [os.path.join(out_dir, f) for f in sorted(os.listdir(out_dir))]
+    return [f for f in files if os.path.isfile(f)]
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Пришли ссылку на видео из Instagram или YouTube — верну файл."
+        "Пришли ссылку на видео или фото (Instagram, TikTok, YouTube, VK) — верну файл."
     )
+
+
+async def send_one(context, chat_id, path):
+    """Отправляет один файл в зависимости от типа (видео/фото/иное)."""
+    ext = os.path.splitext(path)[1].lower()
+    with open(path, "rb") as f:
+        if ext in VIDEO_EXT:
+            await context.bot.send_video(chat_id=chat_id, video=f, supports_streaming=True)
+        elif ext in IMAGE_EXT:
+            await context.bot.send_photo(chat_id=chat_id, photo=f)
+        else:
+            await context.bot.send_document(chat_id=chat_id, document=f)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -99,25 +118,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     with tempfile.TemporaryDirectory() as tmp:
         try:
-            path = download_video(url, tmp)
+            files = download_media(url, tmp)
         except Exception as e:
             logger.error("Ошибка скачивания: %s", e)
-            await update.message.reply_text("Не получилось скачать это видео.")
+            files = []
+
+        if not files:
+            await update.message.reply_text("Не получилось скачать это медиа.")
             return
 
-        if not os.path.exists(path):
-            await update.message.reply_text("Не получилось скачать это видео.")
-            return
+        sent = 0
+        for path in files:
+            if os.path.getsize(path) > MAX_FILE_SIZE:
+                continue  # пропускаем то, что больше лимита Telegram
+            try:
+                await send_one(context, chat_id, path)
+                sent += 1
+            except Exception as e:
+                logger.error("Ошибка отправки %s: %s", path, e)
 
-        if os.path.getsize(path) > MAX_FILE_SIZE:
+        if sent == 0:
             await update.message.reply_text(
-                "Видео больше 50 МБ — Telegram не даёт боту отправить такой файл."
+                "Файл(ы) скачались, но больше 50 МБ — Telegram не даёт боту их отправить."
             )
-            return
-
-        # Отправляем видео без подписи и любых комментариев.
-        with open(path, "rb") as f:
-            await context.bot.send_video(chat_id=chat_id, video=f, supports_streaming=True)
 
 
 def main() -> None:
