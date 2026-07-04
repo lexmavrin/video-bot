@@ -3,6 +3,7 @@ import re
 import tempfile
 import logging
 import threading
+import subprocess
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update
@@ -80,9 +81,34 @@ def download_media(url: str, out_dir: str) -> list:
         ydl_opts["cookiefile"] = COOKIES_FILE
     if PROXY:
         ydl_opts["proxy"] = PROXY
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
-    # Собираем всё, что реально скачалось, по порядку.
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+    except Exception as e:
+        logger.warning("yt-dlp не смог: %s", e)
+
+    files = _list_files(out_dir)
+    if files:
+        return files
+
+    # Фото-посты (Instagram и т.п.) yt-dlp часто не берёт — пробуем gallery-dl.
+    logger.info("Пробую gallery-dl для %s", url)
+    cmd = ["gallery-dl", "-q", "-D", out_dir]
+    if COOKIES_FILE and os.path.exists(COOKIES_FILE):
+        cmd += ["--cookies", COOKIES_FILE]
+    if PROXY:
+        cmd += ["--proxy", PROXY]
+    cmd.append(url)
+    try:
+        subprocess.run(cmd, timeout=120, check=False)
+    except Exception as e:
+        logger.warning("gallery-dl не смог: %s", e)
+
+    return _list_files(out_dir)
+
+
+def _list_files(out_dir: str) -> list:
+    """Возвращает список скачанных файлов по порядку."""
     files = [os.path.join(out_dir, f) for f in sorted(os.listdir(out_dir))]
     return [f for f in files if os.path.isfile(f)]
 
