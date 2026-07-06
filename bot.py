@@ -2,9 +2,7 @@ import os
 import re
 import tempfile
 import logging
-import threading
 import subprocess
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update
 from telegram.constants import ChatAction
@@ -32,6 +30,13 @@ COOKIES_FILE = os.environ.get("COOKIES_FILE")
 # Необязательный прокси (SOCKS5/HTTP) для обхода блокировок по IP.
 PROXY = os.environ.get("PROXY")
 
+# Порт, который слушает сервис (Render задаёт его сам).
+PORT = int(os.environ.get("PORT", "8080"))
+
+# Публичный адрес сервиса для webhook. На Render подставляется автоматически
+# через RENDER_EXTERNAL_URL. Если пусто — бот работает через polling (локально).
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -39,26 +44,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 URL_RE = re.compile(r"https?://\S+")
-
-
-# --- Мини веб-сервер для Render ---
-# Render требует, чтобы бесплатный сервис слушал порт из $PORT.
-# Он же нужен, чтобы «будильник» (UptimeRobot) пинговал бота и тот не засыпал.
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"ok")
-
-    def log_message(self, *args):
-        pass  # не засоряем логи
-
-
-def start_health_server():
-    port = int(os.environ.get("PORT", "8080"))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    logger.info("Health-сервер слушает порт %s", port)
 
 
 VIDEO_EXT = {".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi"}
@@ -173,14 +158,26 @@ def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Задайте переменную окружения BOT_TOKEN")
 
-    start_health_server()
-
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Бот запущен")
-    app.run_polling()
+    if WEBHOOK_URL:
+        # Режим webhook (для облака): Telegram сам присылает сообщения на наш
+        # адрес — это будит сервис и не требует «будильника».
+        base = WEBHOOK_URL.rstrip("/")
+        logger.info("Бот запущен (webhook) на %s", base)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=BOT_TOKEN,               # секретный путь
+            webhook_url=f"{base}/{BOT_TOKEN}",
+            drop_pending_updates=True,
+        )
+    else:
+        # Режим polling (для локального запуска).
+        logger.info("Бот запущен (polling)")
+        app.run_polling()
 
 
 if __name__ == "__main__":
