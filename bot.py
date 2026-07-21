@@ -172,7 +172,9 @@ def main() -> None:
             port=PORT,
             url_path=BOT_TOKEN,               # секретный путь
             webhook_url=f"{base}/{BOT_TOKEN}",
-            drop_pending_updates=True,
+            # ВАЖНО: не отбрасывать накопившиеся сообщения. Именно входящее
+            # сообщение будит уснувший сервис — его нельзя терять при старте.
+            drop_pending_updates=False,
         )
     else:
         # Режим polling (для локального запуска).
