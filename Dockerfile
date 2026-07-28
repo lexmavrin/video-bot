@@ -1,7 +1,8 @@
 FROM python:3.12-slim
 
 # ffmpeg нужен yt-dlp для склейки видео и аудио
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+# aria2 — многопоточная закачка, заметно ускоряет скачивание видео
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg aria2 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

@@ -9,6 +9,9 @@
    - macOS: `brew install ffmpeg`
    - Linux: `sudo apt install ffmpeg`
 
+   Опционально: поставь ещё `aria2` (`brew install aria2` / `sudo apt install aria2`) —
+   бот сам его подхватит и будет качать видео в 16 потоков параллельно, заметно быстрее.
+
 2. Установи зависимости:
    ```
    pip install -r requirements.txt
