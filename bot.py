@@ -51,6 +51,13 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"ok")
 
+    def do_HEAD(self):
+        # UptimeRobot по умолчанию проверяет HEAD-запросом.
+        # Без этого метода сервер отвечает 501, монитор считает сайт "упавшим",
+        # и по факту бот всё это время не будили как надо.
+        self.send_response(200)
+        self.end_headers()
+
     def log_message(self, *args):
         pass  # не засоряем логи
 
