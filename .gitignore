@@ -1,0 +1,13 @@
+# Secrets
+cookies.txt
+*.cookies.txt
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Local downloads / temp
+.tmp/
+downloads/
