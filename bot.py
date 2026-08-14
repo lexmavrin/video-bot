@@ -66,6 +66,26 @@ ARIA2C_PATH = shutil.which("aria2c")
 GALLERY_DL_PATH = shutil.which("gallery-dl")
 
 
+def prepare_cookie_file() -> None:
+    """Копирует Render Secret File в записываемый /tmp для yt-dlp.
+
+    Render монтирует /etc/secrets только для чтения, а yt-dlp может обновлять
+    cookie-файл после запроса. Поэтому работать напрямую с Secret File нельзя.
+    """
+    global COOKIES_FILE
+    if not COOKIES_FILE or not os.path.exists(COOKIES_FILE):
+        return
+
+    runtime_path = "/tmp/video-bot-cookies.txt"
+    try:
+        shutil.copyfile(COOKIES_FILE, runtime_path)
+        os.chmod(runtime_path, 0o600)
+        COOKIES_FILE = runtime_path
+        logger.info("Cookies runtime copy: ready")
+    except Exception as exc:
+        logger.warning("Cookies runtime copy failed: %s", exc)
+
+
 def log_cookie_diagnostics() -> None:
     """Логирует только безопасные метаданные cookie-файла, без значений cookies."""
     if not COOKIES_FILE:
@@ -462,6 +482,7 @@ def main() -> None:
         raise SystemExit("Задайте переменную окружения BOT_TOKEN")
 
     start_health_server()
+    prepare_cookie_file()
     log_cookie_diagnostics()
 
     app = Application.builder().token(BOT_TOKEN).build()
