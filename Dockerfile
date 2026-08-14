@@ -14,4 +14,4 @@ COPY bot.py .
 # Если используешь cookies — положи cookies.txt рядом, он скопируется в образ:
 COPY . .
 
-CMD ["python", "bot.py"]
+CMD ["python", "runner.py"]
