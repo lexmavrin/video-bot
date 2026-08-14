@@ -51,6 +51,10 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+# python-telegram-bot использует httpx. На INFO он пишет полный Bot API URL,
+# в котором находится токен. Не допускаем появления токена в Render Logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
@@ -60,6 +64,43 @@ AUDIO_EXTS = {".mp3", ".m4a"}
 
 ARIA2C_PATH = shutil.which("aria2c")
 GALLERY_DL_PATH = shutil.which("gallery-dl")
+
+
+def log_cookie_diagnostics() -> None:
+    """Логирует только безопасные метаданные cookie-файла, без значений cookies."""
+    if not COOKIES_FILE:
+        logger.warning("Cookies diagnostics: COOKIES_FILE is not set")
+        return
+
+    if not os.path.exists(COOKIES_FILE):
+        logger.warning("Cookies diagnostics: file not found at %s", COOKIES_FILE)
+        return
+
+    try:
+        size = os.path.getsize(COOKIES_FILE)
+        youtube_rows = 0
+        google_rows = 0
+        total_cookie_rows = 0
+        with open(COOKIES_FILE, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                total_cookie_rows += 1
+                lower = stripped.lower()
+                if "youtube.com" in lower or "youtu.be" in lower:
+                    youtube_rows += 1
+                if "google.com" in lower:
+                    google_rows += 1
+        logger.info(
+            "Cookies diagnostics: found=yes size=%s bytes rows=%s youtube_rows=%s google_rows=%s",
+            size,
+            total_cookie_rows,
+            youtube_rows,
+            google_rows,
+        )
+    except Exception as exc:
+        logger.warning("Cookies diagnostics: could not inspect file: %s", exc)
 
 
 # --- Health endpoint для Render ---
@@ -146,7 +187,6 @@ def common_ydl_opts(out_dir: str) -> dict:
         "fragment_retries": 3,
     }
     if ARIA2C_PATH:
-        # 4 соединения — компромисс между скоростью и нагрузкой на слабом сервере.
         opts["external_downloader"] = "aria2c"
         opts["external_downloader_args"] = {
             "aria2c": ["-x", "4", "-s", "4", "-k", "1M"]
@@ -178,8 +218,6 @@ def clear_dir(out_dir: str) -> None:
 
 
 def _quality_format(height: int) -> str:
-    # Сначала стараемся взять готовый mp4 до лимита, чтобы не тратить CPU на merge.
-    # Если такого нет — разрешаем video+audio и ffmpeg только склеивает потоки без перекодирования.
     limit = MAX_FILE_SIZE_MB
     return (
         f"best[height<={height}][ext=mp4][filesize<{limit}M]/"
@@ -229,8 +267,6 @@ def download_audio(url: str, out_dir: str) -> str:
     opts = common_ydl_opts(out_dir)
     opts.update({
         "format": f"bestaudio[filesize<{MAX_FILE_SIZE_MB}M]/bestaudio[filesize_approx<{MAX_FILE_SIZE_MB}M]/bestaudio",
-        # Telegram гарантированно показывает MP3/M4A в музыкальном плеере.
-        # 128 кбит/с заметно экономит размер и остаётся лёгким для CPU по сравнению с видео.
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
@@ -310,7 +346,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def send_gallery(context: ContextTypes.DEFAULT_TYPE, chat_id: int, paths: Iterable[str]) -> None:
     paths = list(paths)
-    # Telegram media group принимает 2–10 элементов. Один файл отправляем отдельно.
     if len(paths) == 1:
         path = paths[0]
         ext = Path(path).suffix.lower()
@@ -333,12 +368,10 @@ async def send_gallery(context: ContextTypes.DEFAULT_TYPE, chat_id: int, paths: 
             elif ext == ".mp4":
                 media.append(InputMediaVideo(media=fh, supports_streaming=True))
             else:
-                # В альбом нельзя смешать произвольный Document с фото/видео.
                 continue
         if len(media) >= 2:
             await context.bot.send_media_group(chat_id=chat_id, media=media)
         elif len(media) == 1:
-            # Редкий случай: после фильтрации остался один допустимый элемент.
             item_path = next(p for p in paths if Path(p).suffix.lower() in PHOTO_EXTS | {".mp4"})
             await send_gallery(context, chat_id, [item_path])
 
@@ -362,7 +395,6 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await query.answer("Эта кнопка относится к ссылке другого пользователя.", show_alert=True)
         return
 
-    # Один набор кнопок — одна загрузка, чтобы случайными нажатиями не забить очередь.
     PENDING.pop(token, None)
     chat_id = update.effective_chat.id
 
@@ -430,6 +462,7 @@ def main() -> None:
         raise SystemExit("Задайте переменную окружения BOT_TOKEN")
 
     start_health_server()
+    log_cookie_diagnostics()
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
