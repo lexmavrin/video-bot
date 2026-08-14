@@ -100,7 +100,10 @@ def log_cookie_diagnostics() -> None:
                     google_rows += 1
         logger.info(
             "Cookies diagnostics: found=yes size=%s bytes rows=%s youtube_rows=%s google_rows=%s",
-            size, total_cookie_rows, youtube_rows, google_rows,
+            size,
+            total_cookie_rows,
+            youtube_rows,
+            google_rows,
         )
     except Exception as exc:
         logger.warning("Cookies diagnostics: could not inspect file: %s", exc)
@@ -187,7 +190,9 @@ def common_ydl_opts(out_dir: str) -> dict:
     }
     if ARIA2C_PATH:
         opts["external_downloader"] = "aria2c"
-        opts["external_downloader_args"] = {"aria2c": ["-x", "4", "-s", "4", "-k", "1M"]}
+        opts["external_downloader_args"] = {
+            "aria2c": ["-x", "4", "-s", "4", "-k", "1M"]
+        }
     if COOKIES_FILE and os.path.exists(COOKIES_FILE):
         opts["cookiefile"] = COOKIES_FILE
     if PROXY:
@@ -214,39 +219,153 @@ def clear_dir(out_dir: str) -> None:
                 pass
 
 
-def _quality_format(height: int) -> str:
-    return (
-        f"bv*[height<={height}]+ba/"
-        f"b[height<={height}]/"
-        f"bv*+ba/b"
+def _extract_info(url: str) -> dict:
+    opts = common_ydl_opts(tempfile.gettempdir())
+    opts.update({
+        "skip_download": True,
+        "noplaylist": True,
+    })
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+def _estimate_size(fmt: dict, duration: float | int | None) -> int | None:
+    size = fmt.get("filesize") or fmt.get("filesize_approx")
+    if size:
+        return int(size)
+    tbr = fmt.get("tbr")
+    if tbr and duration:
+        return int(float(tbr) * 1000 / 8 * float(duration))
+    return None
+
+
+def _select_video_format(info: dict, max_height: int) -> tuple[str, int]:
+    duration = info.get("duration") or 0
+    formats = info.get("formats") or []
+
+    muxed = []
+    video_only = []
+    audio_only = []
+
+    for fmt in formats:
+        if fmt.get("url") is None:
+            continue
+        vcodec = fmt.get("vcodec")
+        acodec = fmt.get("acodec")
+        if vcodec and vcodec != "none" and acodec and acodec != "none":
+            muxed.append(fmt)
+        elif vcodec and vcodec != "none" and (not acodec or acodec == "none"):
+            video_only.append(fmt)
+        elif (not vcodec or vcodec == "none") and acodec and acodec != "none":
+            audio_only.append(fmt)
+
+    def within_height(fmt: dict) -> bool:
+        height = fmt.get("height") or 0
+        return 0 < height <= max_height
+
+    # Предпочитаем готовый video+audio: не нужен merge и меньше нагрузка.
+    muxed = [fmt for fmt in muxed if within_height(fmt)]
+    muxed.sort(
+        key=lambda fmt: (
+            fmt.get("height") or 0,
+            fmt.get("tbr") or 0,
+        ),
+        reverse=True,
+    )
+    for fmt in muxed:
+        size = _estimate_size(fmt, duration)
+        if size is None or size <= MAX_FILE_SIZE:
+            return str(fmt["format_id"]), int(fmt.get("height") or max_height)
+
+    # Если готового файла нет, используем реальные ID video-only + audio-only.
+    videos = [fmt for fmt in video_only if within_height(fmt)]
+    videos.sort(
+        key=lambda fmt: (
+            fmt.get("height") or 0,
+            fmt.get("tbr") or 0,
+        ),
+        reverse=True,
+    )
+    audios = sorted(
+        audio_only,
+        key=lambda fmt: fmt.get("abr") or fmt.get("tbr") or 0,
+        reverse=True,
     )
 
+    for video_fmt in videos:
+        for audio_fmt in audios[:8]:
+            video_size = _estimate_size(video_fmt, duration)
+            audio_size = _estimate_size(audio_fmt, duration)
+            if (
+                video_size is not None
+                and audio_size is not None
+                and video_size + audio_size > MAX_FILE_SIZE
+            ):
+                continue
+            return (
+                f"{video_fmt['format_id']}+{audio_fmt['format_id']}",
+                int(video_fmt.get("height") or max_height),
+            )
 
-def download_video(url: str, out_dir: str, requested_height: int | None) -> tuple[str, int]:
+    raise RuntimeError(f"Нет доступного видеоформата до {max_height}p")
+
+
+def download_video(
+    url: str,
+    out_dir: str,
+    requested_height: int | None,
+) -> tuple[str, int]:
+    info = _extract_info(url)
+
     ladder = [1080, 720, 480, 360]
     if requested_height:
-        ladder = [h for h in ladder if h <= requested_height]
+        ladder = [height for height in ladder if height <= requested_height]
         if requested_height not in ladder:
             ladder.insert(0, requested_height)
 
     last_error: Exception | None = None
+
     for height in ladder:
         clear_dir(out_dir)
-        opts = common_ydl_opts(out_dir)
-        opts.update({"format": _quality_format(height), "merge_output_format": "mp4"})
         try:
+            format_id, actual_height = _select_video_format(info, height)
+            logger.info(
+                "Selected video format: %s, target=%sp, actual=%sp",
+                format_id,
+                height,
+                actual_height,
+            )
+
+            opts = common_ydl_opts(out_dir)
+            opts.update({
+                "format": format_id,
+                "merge_output_format": "mp4",
+            })
+
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.extract_info(url, download=True)
-            candidates = [p for p in media_files(out_dir) if Path(p).suffix.lower() in VIDEO_EXTS]
+
+            candidates = [
+                path
+                for path in media_files(out_dir)
+                if Path(path).suffix.lower() in VIDEO_EXTS
+            ]
             if not candidates:
                 raise RuntimeError("yt-dlp не создал видеофайл")
+
             path = max(candidates, key=os.path.getsize)
             if os.path.getsize(path) <= MAX_FILE_SIZE:
-                return path, height
-            logger.info("Видео %sp слишком большое (%s байт), пробуем ниже", height, os.path.getsize(path))
+                return path, actual_height
+
+            last_error = RuntimeError("Видео больше лимита Telegram")
+            logger.info(
+                "Файл %sp слишком большой (%s байт), пробуем качество ниже",
+                actual_height,
+                os.path.getsize(path),
+            )
         except Exception as exc:
             last_error = exc
-            logger.info("Не удалось скачать %sp: %s", height, exc)
+            logger.info("Не удалось скачать до %sp: %s", height, exc)
 
     if last_error:
         raise last_error
@@ -257,7 +376,7 @@ def download_audio(url: str, out_dir: str) -> str:
     clear_dir(out_dir)
     opts = common_ydl_opts(out_dir)
     opts.update({
-        "format": f"bestaudio[filesize<{MAX_FILE_SIZE_MB}M]/bestaudio[filesize_approx<{MAX_FILE_SIZE_MB}M]/bestaudio",
+        "format": "bestaudio/best",
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
@@ -266,7 +385,11 @@ def download_audio(url: str, out_dir: str) -> str:
     })
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.extract_info(url, download=True)
-    candidates = [p for p in media_files(out_dir) if Path(p).suffix.lower() in AUDIO_EXTS]
+    candidates = [
+        path
+        for path in media_files(out_dir)
+        if Path(path).suffix.lower() in AUDIO_EXTS
+    ]
     if not candidates:
         raise RuntimeError("Не удалось создать аудиофайл")
     path = max(candidates, key=os.path.getsize)
@@ -285,12 +408,18 @@ def download_gallery(url: str, out_dir: str) -> list[str]:
     if PROXY:
         cmd += ["--proxy", PROXY]
     cmd.append(url)
+
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "gallery-dl error").strip()
         raise RuntimeError(detail[-1000:])
-    files = [p for p in media_files(out_dir) if Path(p).suffix.lower() in PHOTO_EXTS | VIDEO_EXTS]
-    files = [p for p in files if os.path.getsize(p) <= MAX_FILE_SIZE]
+
+    files = [
+        path
+        for path in media_files(out_dir)
+        if Path(path).suffix.lower() in PHOTO_EXTS | VIDEO_EXTS
+    ]
+    files = [path for path in files if os.path.getsize(path) <= MAX_FILE_SIZE]
     if not files:
         raise RuntimeError("В публикации не найдено подходящих фото/видео")
     return files[:MAX_GALLERY_ITEMS]
@@ -312,14 +441,20 @@ def chooser_keyboard(token: str) -> InlineKeyboardMarkup:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Пришли ссылку на публикацию или видео. Я могу вернуть видео, аудио, фото или карусель.")
+    await update.message.reply_text(
+        "Пришли ссылку на публикацию или видео. Я могу вернуть видео, аудио, фото или карусель."
+    )
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
     text = update.message.text or ""
     match = URL_RE.search(text)
     if not match:
         return
+
     url = match.group(0).rstrip(".,;:!?)\"]}")
     token = register_request(url, update.effective_user.id)
     await update.message.reply_text(
@@ -329,7 +464,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
-async def send_gallery(context: ContextTypes.DEFAULT_TYPE, chat_id: int, paths: Iterable[str]) -> None:
+async def send_gallery(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    paths: Iterable[str],
+) -> None:
     paths = list(paths)
     if len(paths) == 1:
         path = paths[0]
@@ -338,7 +477,11 @@ async def send_gallery(context: ContextTypes.DEFAULT_TYPE, chat_id: int, paths: 
             if ext in PHOTO_EXTS:
                 await context.bot.send_photo(chat_id=chat_id, photo=f)
             elif ext == ".mp4":
-                await context.bot.send_video(chat_id=chat_id, video=f, supports_streaming=True)
+                await context.bot.send_video(
+                    chat_id=chat_id,
+                    video=f,
+                    supports_streaming=True,
+                )
             else:
                 await context.bot.send_document(chat_id=chat_id, document=f)
         return
@@ -352,20 +495,31 @@ async def send_gallery(context: ContextTypes.DEFAULT_TYPE, chat_id: int, paths: 
                 media.append(InputMediaPhoto(media=fh))
             elif ext == ".mp4":
                 media.append(InputMediaVideo(media=fh, supports_streaming=True))
+
         if len(media) >= 2:
             await context.bot.send_media_group(chat_id=chat_id, media=media)
         elif len(media) == 1:
-            item_path = next(p for p in paths if Path(p).suffix.lower() in PHOTO_EXTS | {".mp4"})
+            item_path = next(
+                path
+                for path in paths
+                if Path(path).suffix.lower() in PHOTO_EXTS | {".mp4"}
+            )
             await send_gallery(context, chat_id, [item_path])
 
 
-async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_choice(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
     query = update.callback_query
     await query.answer()
+
     try:
         _, token, action = query.data.split(":", 2)
     except ValueError:
-        await query.edit_message_text("Эта кнопка устарела. Пришли ссылку ещё раз.")
+        await query.edit_message_text(
+            "Эта кнопка устарела. Пришли ссылку ещё раз."
+        )
         return
 
     req = PENDING.get(token)
@@ -373,8 +527,12 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         PENDING.pop(token, None)
         await query.edit_message_text("Ссылка устарела. Пришли её ещё раз.")
         return
+
     if req.user_id != update.effective_user.id:
-        await query.answer("Эта кнопка относится к ссылке другого пользователя.", show_alert=True)
+        await query.answer(
+            "Эта кнопка относится к ссылке другого пользователя.",
+            show_alert=True,
+        )
         return
 
     PENDING.pop(token, None)
@@ -387,44 +545,91 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "720": "⏳ Скачиваю 720p…",
         "480": "⏳ Скачиваю 480p…",
     }
-    await query.edit_message_text(status_by_action.get(action, "⏳ Скачиваю…"))
+    await query.edit_message_text(
+        status_by_action.get(action, "⏳ Скачиваю…")
+    )
 
     entered = False
     try:
         position = await DOWNLOAD_QUEUE.enter()
         entered = True
+
         if position > MAX_CONCURRENT_DOWNLOADS:
-            await query.edit_message_text(f"⏳ В очереди: примерно №{position}. Начну автоматически.")
-            await query.edit_message_text(status_by_action.get(action, "⏳ Скачиваю…"))
+            await query.edit_message_text(
+                f"⏳ В очереди: примерно №{position}. Начну автоматически."
+            )
+            await query.edit_message_text(
+                status_by_action.get(action, "⏳ Скачиваю…")
+            )
 
         with tempfile.TemporaryDirectory() as tmp:
             if action == "gallery":
-                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
-                paths = await asyncio.to_thread(download_gallery, req.url, tmp)
+                await context.bot.send_chat_action(
+                    chat_id=chat_id,
+                    action=ChatAction.UPLOAD_PHOTO,
+                )
+                paths = await asyncio.to_thread(
+                    download_gallery,
+                    req.url,
+                    tmp,
+                )
                 await send_gallery(context, chat_id, paths)
+
             elif action == "audio":
-                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+                await context.bot.send_chat_action(
+                    chat_id=chat_id,
+                    action=ChatAction.UPLOAD_DOCUMENT,
+                )
                 path = await asyncio.to_thread(download_audio, req.url, tmp)
                 with open(path, "rb") as f:
                     await context.bot.send_audio(chat_id=chat_id, audio=f)
+
             else:
                 requested_height = None if action == "best" else int(action)
-                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
-                path, actual_height = await asyncio.to_thread(download_video, req.url, tmp, requested_height)
+                await context.bot.send_chat_action(
+                    chat_id=chat_id,
+                    action=ChatAction.UPLOAD_VIDEO,
+                )
+                path, actual_height = await asyncio.to_thread(
+                    download_video,
+                    req.url,
+                    tmp,
+                    requested_height,
+                )
                 with open(path, "rb") as f:
                     if Path(path).suffix.lower() == ".mp4":
-                        await context.bot.send_video(chat_id=chat_id, video=f, supports_streaming=True)
+                        await context.bot.send_video(
+                            chat_id=chat_id,
+                            video=f,
+                            supports_streaming=True,
+                        )
                     else:
-                        await context.bot.send_document(chat_id=chat_id, document=f)
+                        await context.bot.send_document(
+                            chat_id=chat_id,
+                            document=f,
+                        )
+
                 if requested_height and actual_height < requested_height:
-                    logger.info("Для %sp автоматически выбран %sp из-за лимита размера", requested_height, actual_height)
+                    logger.info(
+                        "Для %sp автоматически выбран %sp",
+                        requested_height,
+                        actual_height,
+                    )
+
         await query.delete_message()
+
     except subprocess.TimeoutExpired:
-        await query.edit_message_text("Не получилось: сайт слишком долго отвечал. Попробуй ещё раз.")
+        await query.edit_message_text(
+            "Не получилось: сайт слишком долго отвечал. Попробуй ещё раз."
+        )
     except Exception as exc:
         logger.exception("Ошибка обработки %s: %s", req.url, exc)
         message = str(exc).lower()
-        if "larger" in message or "лимит" in message or "too large" in message:
+        if (
+            "larger" in message
+            or "лимит" in message
+            or "too large" in message
+        ):
             text = "Не удалось подобрать вариант меньше 50 МБ. Попробуй 480p или аудио."
         else:
             text = "Не получилось скачать этот контент. Попробуй другой вариант или ссылку."
@@ -437,14 +642,23 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Задайте переменную окружения BOT_TOKEN")
+
     start_health_server()
     prepare_cookie_file()
     log_cookie_diagnostics()
+
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_choice, pattern=r"^dl:"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("Бот запущен: max_file=%sMB, concurrent=%s", MAX_FILE_SIZE_MB, MAX_CONCURRENT_DOWNLOADS)
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+    )
+
+    logger.info(
+        "Бот запущен: max_file=%sMB, concurrent=%s",
+        MAX_FILE_SIZE_MB,
+        MAX_CONCURRENT_DOWNLOADS,
+    )
     app.run_polling()
 
 
