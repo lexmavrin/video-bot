@@ -38,11 +38,8 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 COOKIES_FILE = os.environ.get("COOKIES_FILE")
 PROXY = os.environ.get("PROXY")
 
-# Bot API принимает до 50 МБ; оставляем запас под multipart/служебные данные.
 MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "49"))
 MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
-
-# На слабом Render по умолчанию выполняем только одну тяжёлую загрузку за раз.
 MAX_CONCURRENT_DOWNLOADS = max(1, int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "1")))
 MAX_GALLERY_ITEMS = max(1, int(os.environ.get("MAX_GALLERY_ITEMS", "10")))
 REQUEST_TTL_SECONDS = 30 * 60
@@ -51,8 +48,6 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-# python-telegram-bot использует httpx. На INFO он пишет полный Bot API URL,
-# в котором находится токен. Не допускаем появления токена в Render Logs.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
@@ -67,15 +62,9 @@ GALLERY_DL_PATH = shutil.which("gallery-dl")
 
 
 def prepare_cookie_file() -> None:
-    """Копирует Render Secret File в записываемый /tmp для yt-dlp.
-
-    Render монтирует /etc/secrets только для чтения, а yt-dlp может обновлять
-    cookie-файл после запроса. Поэтому работать напрямую с Secret File нельзя.
-    """
     global COOKIES_FILE
     if not COOKIES_FILE or not os.path.exists(COOKIES_FILE):
         return
-
     runtime_path = "/tmp/video-bot-cookies.txt"
     try:
         shutil.copyfile(COOKIES_FILE, runtime_path)
@@ -87,15 +76,12 @@ def prepare_cookie_file() -> None:
 
 
 def log_cookie_diagnostics() -> None:
-    """Логирует только безопасные метаданные cookie-файла, без значений cookies."""
     if not COOKIES_FILE:
         logger.warning("Cookies diagnostics: COOKIES_FILE is not set")
         return
-
     if not os.path.exists(COOKIES_FILE):
         logger.warning("Cookies diagnostics: file not found at %s", COOKIES_FILE)
         return
-
     try:
         size = os.path.getsize(COOKIES_FILE)
         youtube_rows = 0
@@ -114,16 +100,12 @@ def log_cookie_diagnostics() -> None:
                     google_rows += 1
         logger.info(
             "Cookies diagnostics: found=yes size=%s bytes rows=%s youtube_rows=%s google_rows=%s",
-            size,
-            total_cookie_rows,
-            youtube_rows,
-            google_rows,
+            size, total_cookie_rows, youtube_rows, google_rows,
         )
     except Exception as exc:
         logger.warning("Cookies diagnostics: could not inspect file: %s", exc)
 
 
-# --- Health endpoint для Render ---
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -145,7 +127,6 @@ def start_health_server() -> None:
     logger.info("Health-сервер слушает порт %s", port)
 
 
-# --- Очередь и короткоживущие ссылки для inline-кнопок ---
 @dataclass
 class PendingRequest:
     url: str
@@ -182,8 +163,7 @@ PENDING: dict[str, PendingRequest] = {}
 
 def cleanup_pending() -> None:
     cutoff = time.time() - REQUEST_TTL_SECONDS
-    expired = [key for key, req in PENDING.items() if req.created_at < cutoff]
-    for key in expired:
+    for key in [key for key, req in PENDING.items() if req.created_at < cutoff]:
         PENDING.pop(key, None)
 
 
@@ -194,7 +174,6 @@ def register_request(url: str, user_id: int) -> str:
     return token
 
 
-# --- Скачивание ---
 def common_ydl_opts(out_dir: str) -> dict:
     opts = {
         "outtmpl": os.path.join(out_dir, "%(title).80s-%(id)s.%(ext)s"),
@@ -208,9 +187,7 @@ def common_ydl_opts(out_dir: str) -> dict:
     }
     if ARIA2C_PATH:
         opts["external_downloader"] = "aria2c"
-        opts["external_downloader_args"] = {
-            "aria2c": ["-x", "4", "-s", "4", "-k", "1M"]
-        }
+        opts["external_downloader_args"] = {"aria2c": ["-x", "4", "-s", "4", "-k", "1M"]}
     if COOKIES_FILE and os.path.exists(COOKIES_FILE):
         opts["cookiefile"] = COOKIES_FILE
     if PROXY:
@@ -238,13 +215,10 @@ def clear_dir(out_dir: str) -> None:
 
 
 def _quality_format(height: int) -> str:
-    limit = MAX_FILE_SIZE_MB
     return (
-        f"best[height<={height}][ext=mp4][filesize<{limit}M]/"
-        f"best[height<={height}][ext=mp4][filesize_approx<{limit}M]/"
-        f"bestvideo[height<={height}][ext=mp4][filesize<{limit}M]+bestaudio[ext=m4a]/"
-        f"bestvideo[height<={height}][ext=mp4][filesize_approx<{limit}M]+bestaudio[ext=m4a]/"
-        f"best[height<={height}]/best"
+        f"bv*[height<={height}]+ba/"
+        f"b[height<={height}]/"
+        f"bv*+ba/b"
     )
 
 
@@ -259,10 +233,7 @@ def download_video(url: str, out_dir: str, requested_height: int | None) -> tupl
     for height in ladder:
         clear_dir(out_dir)
         opts = common_ydl_opts(out_dir)
-        opts.update({
-            "format": _quality_format(height),
-            "merge_output_format": "mp4",
-        })
+        opts.update({"format": _quality_format(height), "merge_output_format": "mp4"})
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.extract_info(url, download=True)
@@ -314,12 +285,10 @@ def download_gallery(url: str, out_dir: str) -> list[str]:
     if PROXY:
         cmd += ["--proxy", PROXY]
     cmd.append(url)
-
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "gallery-dl error").strip()
         raise RuntimeError(detail[-1000:])
-
     files = [p for p in media_files(out_dir) if Path(p).suffix.lower() in PHOTO_EXTS | VIDEO_EXTS]
     files = [p for p in files if os.path.getsize(p) <= MAX_FILE_SIZE]
     if not files:
@@ -327,7 +296,6 @@ def download_gallery(url: str, out_dir: str) -> list[str]:
     return files[:MAX_GALLERY_ITEMS]
 
 
-# --- Telegram UI ---
 def chooser_keyboard(token: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
@@ -344,9 +312,7 @@ def chooser_keyboard(token: str) -> InlineKeyboardMarkup:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Пришли ссылку на публикацию или видео. Я могу вернуть видео, аудио, фото или карусель."
-    )
+    await update.message.reply_text("Пришли ссылку на публикацию или видео. Я могу вернуть видео, аудио, фото или карусель.")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -354,7 +320,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     match = URL_RE.search(text)
     if not match:
         return
-
     url = match.group(0).rstrip(".,;:!?)\"]}")
     token = register_request(url, update.effective_user.id)
     await update.message.reply_text(
@@ -387,8 +352,6 @@ async def send_gallery(context: ContextTypes.DEFAULT_TYPE, chat_id: int, paths: 
                 media.append(InputMediaPhoto(media=fh))
             elif ext == ".mp4":
                 media.append(InputMediaVideo(media=fh, supports_streaming=True))
-            else:
-                continue
         if len(media) >= 2:
             await context.bot.send_media_group(chat_id=chat_id, media=media)
         elif len(media) == 1:
@@ -399,7 +362,6 @@ async def send_gallery(context: ContextTypes.DEFAULT_TYPE, chat_id: int, paths: 
 async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-
     try:
         _, token, action = query.data.split(":", 2)
     except ValueError:
@@ -417,7 +379,6 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     PENDING.pop(token, None)
     chat_id = update.effective_chat.id
-
     status_by_action = {
         "audio": "⏳ Готовлю аудио…",
         "gallery": "⏳ Скачиваю фото / карусель…",
@@ -441,13 +402,11 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
                 paths = await asyncio.to_thread(download_gallery, req.url, tmp)
                 await send_gallery(context, chat_id, paths)
-
             elif action == "audio":
                 await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
                 path = await asyncio.to_thread(download_audio, req.url, tmp)
                 with open(path, "rb") as f:
                     await context.bot.send_audio(chat_id=chat_id, audio=f)
-
             else:
                 requested_height = None if action == "best" else int(action)
                 await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
@@ -459,9 +418,7 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                         await context.bot.send_document(chat_id=chat_id, document=f)
                 if requested_height and actual_height < requested_height:
                     logger.info("Для %sp автоматически выбран %sp из-за лимита размера", requested_height, actual_height)
-
         await query.delete_message()
-
     except subprocess.TimeoutExpired:
         await query.edit_message_text("Не получилось: сайт слишком долго отвечал. Попробуй ещё раз.")
     except Exception as exc:
@@ -480,21 +437,14 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Задайте переменную окружения BOT_TOKEN")
-
     start_health_server()
     prepare_cookie_file()
     log_cookie_diagnostics()
-
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_choice, pattern=r"^dl:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    logger.info(
-        "Бот запущен: max_file=%sMB, concurrent=%s",
-        MAX_FILE_SIZE_MB,
-        MAX_CONCURRENT_DOWNLOADS,
-    )
+    logger.info("Бот запущен: max_file=%sMB, concurrent=%s", MAX_FILE_SIZE_MB, MAX_CONCURRENT_DOWNLOADS)
     app.run_polling()
 
 
